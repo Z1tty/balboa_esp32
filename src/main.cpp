@@ -53,9 +53,10 @@ portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 //
 // Reference: https://github.com/ccutrer/balboa_worldwide_app/blob/main/doc/protocol.md
 
-static uint32_t g_lastRxMs  = 0;
-static uint8_t  g_deviceId  = 0;   // assigned by spa (0 = unregistered)
-static uint32_t g_lastCtsMs = 0;   // last CTS received (for re-registration watchdog)
+static uint32_t g_lastRxMs      = 0;
+static uint8_t  g_deviceId      = 0;   // assigned by spa (0 = unregistered)
+static uint32_t g_lastCtsMs     = 0;   // last CTS received (for re-registration watchdog)
+static uint8_t  g_rawDumpFrames = 0;   // dump next N raw frames (debug)
 
 static uint8_t balboaCRC(const uint8_t* data, uint8_t len) {
   uint8_t crc = 0x02;
@@ -104,11 +105,13 @@ void rs485Send(const uint8_t mt[3], const uint8_t* pl, uint8_t plLen, bool logFr
   Serial2.write(frame, fi);
   Serial2.flush();
 
-  // Read & discard echo (RS485 half-duplex loopback)
-  delayMicroseconds(500);
-  while (Serial2.available()) Serial2.read();
-
-  delayMicroseconds(100);
+  // Read & discard echo (RS485 half-duplex loopback) — exactly fi bytes,
+  // so we don't accidentally swallow the spa's immediate response.
+  uint32_t echoDeadline = millis() + 10;
+  size_t   echoRead     = 0;
+  while (echoRead < fi && (int32_t)(echoDeadline - millis()) > 0) {
+    if (Serial2.available()) { Serial2.read(); echoRead++; }
+  }
   rs485ReceiveMode();
 
   if (LOG_TX && logFrame) {
@@ -126,6 +129,7 @@ void sendIDRequest() {
   const uint8_t pl[] = { 0x02, 0xF1, 0x73 };
   rs485Send(mt, pl, sizeof(pl), true);
   if (LOG_REG) Serial.println("[REG] ID request sent");
+  g_rawDumpFrames = 5; // dump next 5 raw frames to see spa's response
 }
 
 void sendIDAck() {
@@ -231,31 +235,48 @@ void processFrame(const uint8_t* buf, size_t len) {
 
   g_lastRxMs = millis();
 
-  const uint8_t dest = buf[2]; // destination address
-  const uint8_t cls  = buf[3]; // class byte (0xBF or 0xAF)
-  const uint8_t type = buf[4]; // message type
+  // Raw dump mode — vypíše každý frame v plném rozsahu (debug registrace)
+  if (g_rawDumpFrames > 0) {
+    Serial.printf("[RAW%u] %uB:", g_rawDumpFrames, (unsigned)len);
+    for (size_t i = 0; i < len; i++) Serial.printf(" %02X", buf[i]);
+    Serial.println();
+    g_rawDumpFrames--;
+  }
+
+  const uint8_t dest = buf[2]; // byte2 (source nebo dest podle směru)
+  const uint8_t cls  = buf[3]; // class byte (0xBF nebo 0xAF)
+  const uint8_t type = buf[4]; // typ zprávy
 
   // -------------------- Channel registration --------------------
   // "Any new clients?" FE BF 00
   if (dest == 0xFE && cls == 0xBF && type == 0x00) {
     if (g_deviceId == 0) {
       if (LOG_REG) Serial.println("[REG] Got 'Any new clients?' -> sending ID request");
+      // Clear any stuck pending command so it doesn't block after registration
+      portENTER_CRITICAL(&pendingMux);
+      pendingCmd.ready = false;
+      pendingCmd.type  = CMD_NONE;
+      portEXIT_CRITICAL(&pendingMux);
       sendIDRequest();
     }
     return;
   }
 
-  // "Here is your assigned ID" FE BF 02
-  if (dest == 0xFE && cls == 0xBF && type == 0x02) {
+  // "Here is your assigned ID" — typ 0x02, byte[2] může být 0xFE nebo 0x10 (adresa spa)
+  if (cls == 0xBF && type == 0x02 && g_deviceId == 0) {
     if (len >= 7) {
       uint8_t newId = buf[5];
       if (newId > 0x2F) newId = 0x2F;
       g_deviceId = newId;
-      if (LOG_REG) Serial.printf("[REG] Assigned ID: 0x%02X\n", g_deviceId);
+      if (LOG_REG) Serial.printf("[REG] Assigned ID: 0x%02X (from byte2=0x%02X)\n", g_deviceId, dest);
       sendIDAck();
     }
     return;
   }
+
+  // Silently ignore CTS/NTS for other registered devices (reduces log noise)
+  if (dest != 0xFE && dest != 0xFF && cls == 0xBF && (type == 0x06 || type == 0x07) && dest != g_deviceId)
+    return;
 
   // -------------------- CTS (Clear To Send) addressed to us --------------------
   if (g_deviceId != 0 && dest == g_deviceId && cls == 0xBF && type == 0x06) {
@@ -288,7 +309,13 @@ void processFrame(const uint8_t* buf, size_t len) {
 
   // -------------------- Ignore known noise --------------------
   if (cls == 0xBF && type == 0x07) return; // NTS from other clients
-  if (dest == 0xFE && cls == 0xBF)  return; // other registration traffic
+  // Log unhandled FE BF frames to help diagnose registration
+  if (dest == 0xFE && cls == 0xBF) {
+    Serial.printf("[REG?] Unhandled FE BF type=%02X len=%u:", type, (unsigned)len);
+    for (size_t i = 0; i < len; i++) Serial.printf(" %02X", buf[i]);
+    Serial.println();
+    return;
+  }
 
   // Debug unknown frames (limited output)
   Serial.printf("[OTHER] %uB dest=%02X cls=%02X type=%02X:", (unsigned)len, dest, cls, type);
