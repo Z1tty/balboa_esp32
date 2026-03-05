@@ -1,0 +1,16 @@
+#pragma once
+
+// ---------- WIFI ----------
+#define WIFI_SSID       "your_wifi_ssid"
+#define WIFI_PASSWORD   "your_wifi_password"
+
+// ---------- MQTT ----------
+#define MQTT_SERVER     "192.168.x.x"
+#define MQTT_PORT       1883
+#define MQTT_USER       ""
+#define MQTT_PASS       ""
+
+// ---------- RS485 (ESP32) ----------
+#define PIN_DE_RE   17
+#define PIN_RX2     16
+#define PIN_TX2     4
