@@ -4,12 +4,11 @@
 #include "config.h"
 
 // ------------------------------ Logging -------------------------------------
-// TIP: Keep LOG_TX = true for command debugging, but we intentionally do NOT
-// print the frequent "Nothing-To-Send" keepalive frames to avoid log spam.
-static bool LOG_CTS    = false; // set true only when debugging
+static bool LOG_CTS    = true;  // CTS / NTS events
 static bool LOG_TX     = true;
 static bool LOG_STATUS = true;
 static bool LOG_MQTT   = true;
+static bool LOG_REG    = true;  // channel registration events
 
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
@@ -38,12 +37,25 @@ portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 #define BALBOA_TOGGLE_HEATING_MODE 0x51
 
 // ------------------------------ RS485 protocol ------------------------------
-// This sketch follows the RS485 framing used by the Balboa Worldwide App:
-// - The spa/controller sends a "Ready" frame (MT = 10 BF 06) when it's safe to
-//   send EXACTLY ONE message on the bus.
-// - We send commands with MT = 0A BF xx (toggle = 0A BF 11, set_temp = 0A BF 20).
+// Frame format: 7E [ML] [byte2] [0xBF] [type] [payload...] [CRC] 7E
+// byte2 = destination address (0xFE = broadcast unregistered, 0xFF = all,
+//         our assigned id = addressed to us)
+//
+// Channel registration sequence:
+//   Spa  -> 7E .. FE BF 00 ..  "Any new clients?"
+//   Us   -> 7E .. FE BF 01 02 F1 73 ..  registration request
+//   Spa  -> 7E .. FE BF 02 [id] ..  "Here is your address"
+//   Us   -> 7E .. [id] BF 03 ..  ack
+//
+// Poll cycle (after registration):
+//   Spa  -> 7E .. [id] BF 06 ..  Clear To Send (CTS)
+//   Us   -> command  OR  7E .. [id] BF 07 ..  Nothing To Send (NTS)
+//
 // Reference: https://github.com/ccutrer/balboa_worldwide_app/blob/main/doc/protocol.md
-static uint32_t g_lastRxMs = 0;
+
+static uint32_t g_lastRxMs  = 0;
+static uint8_t  g_deviceId  = 0;   // assigned by spa (0 = unregistered)
+static uint32_t g_lastCtsMs = 0;   // last CTS received (for re-registration watchdog)
 
 static uint8_t balboaCRC(const uint8_t* data, uint8_t len) {
   uint8_t crc = 0x02;
@@ -61,10 +73,10 @@ static bool validateFrame(const uint8_t* buf, size_t len) {
   if (buf[len - 1] != 0x7E) return false;
 
   const uint8_t ml = buf[1];
-  if ((size_t)ml + 2 != len) return false; // total bytes must match ML
+  if ((size_t)ml + 2 != len) return false;
 
   const uint8_t packetCrc = buf[len - 2];
-  const uint8_t calcCrc   = balboaCRC(buf + 1, (uint8_t)(len - 3)); // len + data
+  const uint8_t calcCrc   = balboaCRC(buf + 1, (uint8_t)(len - 3));
   return packetCrc == calcCrc;
 }
 
@@ -78,7 +90,6 @@ void rs485Send(const uint8_t mt[3], const uint8_t* pl, uint8_t plLen, bool logFr
   for (uint8_t i = 0; i < 3;     i++) frame[fi++] = mt[i];
   for (uint8_t i = 0; i < plLen; i++) frame[fi++] = pl[i];
 
-  // CRC is computed over [ML][MT..][payload..]
   uint8_t crcBuf[64];
   uint8_t ci = 0;
   crcBuf[ci++] = ml;
@@ -107,27 +118,47 @@ void rs485Send(const uint8_t mt[3], const uint8_t* pl, uint8_t plLen, bool logFr
   }
 }
 
-// ------------------------ Ready window (CTS) --------------------------------
-// We only transmit after the spa says it's "Ready" (MT = 10 BF 06).
-// The handling is implemented in processFrame().
+// ------------------------------ Registration --------------------------------
+
+void sendIDRequest() {
+  // Registration request: FE BF 01, payload = device identifier bytes
+  const uint8_t mt[] = { 0xFE, 0xBF, 0x01 };
+  const uint8_t pl[] = { 0x02, 0xF1, 0x73 };
+  rs485Send(mt, pl, sizeof(pl), true);
+  if (LOG_REG) Serial.println("[REG] ID request sent");
+}
+
+void sendIDAck() {
+  // Acknowledge assigned address: [id] BF 03
+  const uint8_t mt[] = { g_deviceId, 0xBF, 0x03 };
+  rs485Send(mt, nullptr, 0, true);
+  if (LOG_REG) Serial.printf("[REG] ID ack sent (id=0x%02X)\n", g_deviceId);
+}
+
+void sendNTS() {
+  // Nothing To Send: [id] BF 07
+  const uint8_t mt[] = { g_deviceId, 0xBF, 0x07 };
+  rs485Send(mt, nullptr, 0, false);
+}
 
 // ------------------------------ Commands ------------------------------------
+
 void sendToggle(uint8_t item) {
-  // Toggle item: MT = 0A BF 11, payload = [item, 0x00]
-  const uint8_t mt[] = { 0x0A, 0xBF, 0x11 };
-  const uint8_t pl[] = { item, 0x00 }; // 0x00 = toggle
+  // Toggle item: [id] BF 11, payload = [item, 0x00]
+  const uint8_t mt[] = { g_deviceId, 0xBF, 0x11 };
+  const uint8_t pl[] = { item, 0x00 };
   rs485Send(mt, pl, sizeof(pl), true);
 }
 
 void sendSetTemp(uint8_t tempRaw) {
-  // Set temperature: MT = 0A BF 20, payload = [tempRaw]
-  const uint8_t mt[] = { 0x0A, 0xBF, 0x20 };
+  // Set temperature: [id] BF 20, payload = [tempRaw]
+  const uint8_t mt[] = { g_deviceId, 0xBF, 0x20 };
   const uint8_t pl[] = { tempRaw };
   rs485Send(mt, pl, sizeof(pl), true);
   if (LOG_TX) Serial.printf("[TX] set_temp %.1f C (raw 0x%02X)\n", tempRaw / 2.0f, tempRaw);
 }
 
-// buf[0]=7E, buf[1]=ML, buf[2]=MT0, buf[3]=MT1, buf[4]=MT2, buf[5..]=data
+// buf[0]=7E, buf[1]=ML, buf[2]=dest, buf[3]=class(BF/AF), buf[4]=type, buf[5..]=payload
 void publishStatus(const uint8_t* buf, size_t len) {
   if (len < 30) return;
 
@@ -200,13 +231,36 @@ void processFrame(const uint8_t* buf, size_t len) {
 
   g_lastRxMs = millis();
 
-  const uint8_t mt0 = buf[2];
-  const uint8_t mt1 = buf[3];
-  const uint8_t mt2 = buf[4];
+  const uint8_t dest = buf[2]; // destination address
+  const uint8_t cls  = buf[3]; // class byte (0xBF or 0xAF)
+  const uint8_t type = buf[4]; // message type
 
-  // -------------------- Ready / Clear-To-Send --------------------
-  // Ready: 10 BF 06  (safe to send ONE message now)
-  if (mt0 == 0x10 && mt1 == 0xBF && mt2 == 0x06) {
+  // -------------------- Channel registration --------------------
+  // "Any new clients?" FE BF 00
+  if (dest == 0xFE && cls == 0xBF && type == 0x00) {
+    if (g_deviceId == 0) {
+      if (LOG_REG) Serial.println("[REG] Got 'Any new clients?' -> sending ID request");
+      sendIDRequest();
+    }
+    return;
+  }
+
+  // "Here is your assigned ID" FE BF 02
+  if (dest == 0xFE && cls == 0xBF && type == 0x02) {
+    if (len >= 7) {
+      uint8_t newId = buf[5];
+      if (newId > 0x2F) newId = 0x2F;
+      g_deviceId = newId;
+      if (LOG_REG) Serial.printf("[REG] Assigned ID: 0x%02X\n", g_deviceId);
+      sendIDAck();
+    }
+    return;
+  }
+
+  // -------------------- CTS (Clear To Send) addressed to us --------------------
+  if (g_deviceId != 0 && dest == g_deviceId && cls == 0xBF && type == 0x06) {
+    g_lastCtsMs = millis();
+
     PendingCommand cmd;
     portENTER_CRITICAL(&pendingMux);
     cmd              = pendingCmd;
@@ -215,30 +269,29 @@ void processFrame(const uint8_t* buf, size_t len) {
     portEXIT_CRITICAL(&pendingMux);
 
     if (cmd.ready) {
-      if (LOG_CTS) Serial.printf("[CTS] ready -> sending cmd type=%d\n", cmd.type);
-      // No artificial delay here – the ready window can be short.
+      if (LOG_CTS) Serial.printf("[CTS] sending cmd type=%d\n", cmd.type);
       if (cmd.type == CMD_TOGGLE)   sendToggle(cmd.toggleByte);
       if (cmd.type == CMD_SET_TEMP) sendSetTemp(cmd.tempRaw);
     } else {
-      // Nothing queued; no need to transmit anything.
-      if (LOG_CTS) Serial.println("[CTS] ready (no pending cmd)");
+      sendNTS();
+      if (LOG_CTS) Serial.println("[CTS] NTS");
     }
     return;
   }
 
-  // -------------------- Status --------------------
-  // Status: FF AF 13
-  if (mt0 == 0xFF && mt1 == 0xAF && mt2 == 0x13) {
+  // -------------------- Status update (broadcast) --------------------
+  // FF AF 13
+  if (dest == 0xFF && type == 0x13) {
     publishStatus(buf, len);
     return;
   }
 
-  // -------------------- Noise we don't care about --------------------
-  if (mt0 == 0xFE && mt1 == 0xBF) return; // misc polls/handshake frames
-  if (mt1 == 0xBF && mt2 == 0x07) return; // other clients' "Nothing to Send"
+  // -------------------- Ignore known noise --------------------
+  if (cls == 0xBF && type == 0x07) return; // NTS from other clients
+  if (dest == 0xFE && cls == 0xBF)  return; // other registration traffic
 
-  // Debug "other" frames (limited)
-  Serial.printf("[OTHER] %uB mt=%02X %02X %02X:", (unsigned)len, mt0, mt1, mt2);
+  // Debug unknown frames (limited output)
+  Serial.printf("[OTHER] %uB dest=%02X cls=%02X type=%02X:", (unsigned)len, dest, cls, type);
   for (size_t i = 0; i < len && i < 16; i++) Serial.printf(" %02X", buf[i]);
   if (len > 16) Serial.print(" ...");
   Serial.println();
@@ -260,7 +313,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       pendingCmd.ready      = true;
     }
     portEXIT_CRITICAL(&pendingMux);
-    if (LOG_MQTT) Serial.printf("[CMD] %s toggle 0x%02X\n", busy ? "ignored" : "queued", item);
+    if (LOG_MQTT) Serial.printf("[CMD] %s toggle 0x%02X\n", busy ? "ignored (busy)" : "queued", item);
   };
 
   if      (strcmp(topic, "balboa/cmd/jets1")        == 0) setPendingToggle(BALBOA_TOGGLE_JETS1);
@@ -282,9 +335,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         pendingCmd.ready   = true;
       }
       portEXIT_CRITICAL(&pendingMux);
-      if (LOG_MQTT) Serial.printf("[CMD] %s set_temp %.1f C\n", busy ? "ignored" : "queued", t);
+      if (LOG_MQTT) Serial.printf("[CMD] %s set_temp %.1f C\n", busy ? "ignored (busy)" : "queued", t);
     } else {
-      if (LOG_MQTT) Serial.printf("[CMD] set_temp mimo rozsah: %.1f\n", t);
+      if (LOG_MQTT) Serial.printf("[CMD] set_temp out of range: %.1f\n", t);
     }
   }
 }
@@ -328,7 +381,7 @@ void setup() {
   connectMQTT();
 
   Serial.println("Listening...");
-  Serial.println("Waiting for READY frames (10 BF 06) and status updates (FF AF 13)...");
+  Serial.println("Waiting for registration (FE BF 00) and status updates (FF AF 13)...");
 }
 
 void loop() {
@@ -341,10 +394,19 @@ void loop() {
     mqtt.loop();
   }
 
-  // Optional: if bus goes silent for long, print a warning (and avoid spamming).
+  // No RS485 traffic watchdog — reset registration
   if (g_lastRxMs != 0 && (millis() - g_lastRxMs) > 15000) {
-    Serial.println("[WARN] no RS485 traffic for 15s");
-    g_lastRxMs = millis();
+    Serial.println("[WARN] no RS485 traffic for 15s — resetting registration");
+    g_lastRxMs  = millis();
+    g_deviceId  = 0;
+    g_lastCtsMs = 0;
+  }
+
+  // Registered but no CTS for 10s — spa dropped us, re-register
+  if (g_deviceId != 0 && g_lastCtsMs != 0 && (millis() - g_lastCtsMs) > 10000) {
+    Serial.printf("[WARN] no CTS for 10s (was id=0x%02X) — re-registering\n", g_deviceId);
+    g_deviceId  = 0;
+    g_lastCtsMs = 0;
   }
 
   static uint8_t buffer[256];
@@ -354,7 +416,7 @@ void loop() {
     uint8_t b = Serial2.read();
     if (index < sizeof(buffer)) buffer[index++] = b;
 
-    // Frame boundary is always "... 7E 7E ..." (end + next start)
+    // Frame boundary: two consecutive 0x7E bytes (end of frame + start of next)
     if (index >= 2 && buffer[index-2] == 0x7E && buffer[index-1] == 0x7E) {
       processFrame(buffer, index - 1);
       buffer[0] = 0x7E;
