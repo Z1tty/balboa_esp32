@@ -182,7 +182,7 @@ void publishStatus(const uint8_t* buf, size_t len) {
   static uint32_t lastPublishMs = 0;
   static uint32_t lastAnyMs     = 0;
   static bool     havePrev      = false;
-  static uint8_t  prev[7]       = {0};
+  static uint8_t  prev[9]       = {0};
 
   const uint32_t now = millis();
 
@@ -203,7 +203,7 @@ void publishStatus(const uint8_t* buf, size_t len) {
   bool holdActive = (holdState != 0x00);
 
   uint8_t curr[9] = { waterRaw, setRaw, flags4, pp, flags5, lf, flags3, heatMode, holdMins };
-  bool changed  = !havePrev || memcmp(curr, prev, 9) != 0;
+  bool changed  = !havePrev || memcmp(curr, prev, 8) != 0;
   bool periodic = (now - lastPublishMs) >= 10000;
 
   if (!changed && !periodic) return;
@@ -219,7 +219,8 @@ void publishStatus(const uint8_t* buf, size_t len) {
   bool jets1       = pump1 != 0;
   bool jets2       = pump2 != 0;
   bool blower      = (flags5 & 0x0C) != 0;
-  bool heater      = (flags4 & 0x30) != 0;
+  uint8_t heater   = (flags4 & 0x10) ? 2 : (flags4 & 0x20) ? 1 : 0;
+  // heater: 0=off, 1=waiting (flashing), 2=heating (solid)
   bool circulation = (flags5 & 0x02) != 0;
   bool highRange   = (flags4 & 0x04) != 0;
   bool light       = (lf & 0x03) == 0x03;
@@ -239,7 +240,7 @@ void publishStatus(const uint8_t* buf, size_t len) {
     "{\"water_temp\":%.1f,\"set_temp\":%.1f,"
     "\"time\":\"%02u:%02u\","
     "\"jets1\":%d,\"jets2\":%d,\"blower\":%d,"
-    "\"heater\":%d,\"circulation\":%d,"
+    "\"heater\":%u,\"circulation\":%d,"
     "\"high_range\":%d,\"light\":%d,"
     "\"heating_mode\":\"%s\","
     "\"clock_24h\":%d,"
@@ -247,7 +248,7 @@ void publishStatus(const uint8_t* buf, size_t len) {
     waterTemp, setTemp,
     timeHour, timeMin,
     jets1?1:0, jets2?1:0, blower?1:0,
-    heater?1:0, circulation?1:0,
+    heater, circulation?1:0,
     highRange?1:0, light?1:0,
     heatModeStr,
     clockMode24h?1:0,
@@ -259,7 +260,7 @@ void publishStatus(const uint8_t* buf, size_t len) {
   if (mqtt.connected())
     mqtt.publish("balboa/state", json, true);
 
-  memcpy(prev, curr, 9);
+  memcpy(prev, curr, 8);
   havePrev      = true;
   lastPublishMs = now;
 }
