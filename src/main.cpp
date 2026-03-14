@@ -344,6 +344,19 @@ void processFrame(const uint8_t* buf, size_t len) {
         Serial.printf("[CMD] set_filter FC1=%02u:%02u dur=%uh%02um FC2=%02u:%02u dur=%uh%02um\n",
                       cmd.fc1h, cmd.fc1m, cmd.fc1dh, cmd.fc1dm,
                       cmd.fc2h & 0x7F, cmd.fc2m, cmd.fc2dh, cmd.fc2dm);
+        // Publish immediately — don't wait for BF 23 echo from panel
+        if (mqtt.connected()) {
+          bool fc2en = (cmd.fc2h & 0x80) != 0;
+          char json[200];
+          snprintf(json, sizeof(json),
+            "{\"fc1_start\":\"%02u:%02u\",\"fc1_dur\":\"%uh%02um\","
+            "\"fc2_start\":\"%02u:%02u\",\"fc2_dur\":\"%uh%02um\",\"fc2_enabled\":%d}",
+            cmd.fc1h, cmd.fc1m, cmd.fc1dh, cmd.fc1dm,
+            cmd.fc2h & 0x7F, cmd.fc2m, cmd.fc2dh, cmd.fc2dm,
+            fc2en ? 1 : 0);
+          mqtt.publish("balboa/filter_config", json, true);
+          Serial.printf("[FILTER] immediate publish: %s\n", json);
+        }
         g_rawDumpFrames = 10;
       }
     }
