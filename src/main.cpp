@@ -39,6 +39,7 @@ portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 #define BALBOA_TOGGLE_LIGHT        0x11
 #define BALBOA_TOGGLE_TEMP_RANGE   0x50
 #define BALBOA_TOGGLE_HEATING_MODE 0x51
+#define BALBOA_TOGGLE_HOLD         0x3C
 
 // ------------------------------ RS485 protocol ------------------------------
 // Frame format: 7E [ML] [byte2] [0xBF/0xAF] [type] [payload...] [CRC] 7E
@@ -185,10 +186,12 @@ void publishStatus(const uint8_t* buf, size_t len) {
 
   const uint32_t now = millis();
 
+  const uint8_t holdState = buf[5];   // 0x00=normal, 0x05=hold active
   const uint8_t waterRaw  = buf[7];
   const uint8_t timeHour  = buf[8];   // 0-23
   const uint8_t timeMin   = buf[9];   // 0-59
   const uint8_t heatMode  = buf[10];  // 0=ready, 1=economy/rest
+  const uint8_t holdMins  = buf[12];  // hold minutes remaining (e.g. 60=0x3C)
   const uint8_t flags3    = buf[14];
   // flags3 bit 0: temp scale (0=°F, 1=°C), bit 1: clock mode (0=12h, 1=24h)
   const uint8_t flags4    = buf[15];
@@ -197,8 +200,10 @@ void publishStatus(const uint8_t* buf, size_t len) {
   const uint8_t lf        = buf[19];
   const uint8_t setRaw    = buf[25];
 
-  uint8_t curr[9] = { waterRaw, setRaw, flags4, pp, flags5, lf, flags3, heatMode, timeHour };
-  bool changed  = !havePrev || memcmp(curr, prev, 7) != 0;
+  bool holdActive = (holdState != 0x00);
+
+  uint8_t curr[9] = { waterRaw, setRaw, flags4, pp, flags5, lf, flags3, heatMode, holdMins };
+  bool changed  = !havePrev || memcmp(curr, prev, 9) != 0;
   bool periodic = (now - lastPublishMs) >= 10000;
 
   if (!changed && !periodic) return;
@@ -220,8 +225,8 @@ void publishStatus(const uint8_t* buf, size_t len) {
   bool light       = (lf & 0x03) == 0x03;
 
   if (changed) {
-    Serial.printf("[RAW] w=%02X s=%02X t=%02u:%02u hm=%02X f4=%02X pp=%02X f5=%02X lf=%02X f3=%02X\n",
-                  waterRaw, setRaw, timeHour, timeMin, heatMode, flags4, pp, flags5, lf, flags3);
+    Serial.printf("[RAW] w=%02X s=%02X t=%02u:%02u hm=%02X f4=%02X pp=%02X f5=%02X lf=%02X f3=%02X hold=%02X/%u\n",
+                  waterRaw, setRaw, timeHour, timeMin, heatMode, flags4, pp, flags5, lf, flags3, holdState, holdMins);
   }
 
   // heating_mode: 0=ready (připravený), 1=economy (ekonomický/rest)
@@ -237,14 +242,16 @@ void publishStatus(const uint8_t* buf, size_t len) {
     "\"heater\":%d,\"circulation\":%d,"
     "\"high_range\":%d,\"light\":%d,"
     "\"heating_mode\":\"%s\","
-    "\"clock_24h\":%d}",
+    "\"clock_24h\":%d,"
+    "\"hold\":%d,\"hold_mins\":%u}",
     waterTemp, setTemp,
     timeHour, timeMin,
     jets1?1:0, jets2?1:0, blower?1:0,
     heater?1:0, circulation?1:0,
     highRange?1:0, light?1:0,
     heatModeStr,
-    clockMode24h?1:0
+    clockMode24h?1:0,
+    holdActive?1:0, holdActive ? holdMins : 0
   );
 
   if (LOG_STATUS)
@@ -252,7 +259,7 @@ void publishStatus(const uint8_t* buf, size_t len) {
   if (mqtt.connected())
     mqtt.publish("balboa/state", json, true);
 
-  memcpy(prev, curr, 7);
+  memcpy(prev, curr, 9);
   havePrev      = true;
   lastPublishMs = now;
 }
@@ -350,10 +357,15 @@ void processFrame(const uint8_t* buf, size_t len) {
 
   // -------------------- Filter cycle config (BF 23) --------------------
   if (cls == 0xBF && type == 0x23 && len >= 14) {
-    static uint8_t prevFilter[8] = {0xFF};
-    const uint8_t* pl = buf + 5;  // 8 payload bytes
-    if (memcmp(pl, prevFilter, 8) != 0) {
+    static uint8_t  prevFilter[8]    = {0xFF};
+    static uint32_t lastFilterPubMs  = 0;
+    const uint8_t*  pl = buf + 5;  // 8 payload bytes
+    const uint32_t  now = millis();
+    bool changed  = memcmp(pl, prevFilter, 8) != 0;
+    bool periodic = (now - lastFilterPubMs) >= 30000;
+    if (changed || periodic) {
       memcpy(prevFilter, pl, 8);
+      lastFilterPubMs = now;
       bool fc2en = (pl[4] & 0x80) != 0;
       char json[200];
       snprintf(json, sizeof(json),
@@ -362,7 +374,7 @@ void processFrame(const uint8_t* buf, size_t len) {
         pl[0], pl[1], pl[2], pl[3],
         pl[4] & 0x7F, pl[5], pl[6], pl[7],
         fc2en ? 1 : 0);
-      Serial.printf("[FILTER] %s\n", json);
+      Serial.printf("[FILTER%s] %s\n", changed ? "" : ":hb", json);
       if (mqtt.connected()) mqtt.publish("balboa/filter_config", json, true);
     }
     return;
@@ -424,6 +436,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   else if (strcmp(topic, "balboa/cmd/light")        == 0) setPendingToggle(BALBOA_TOGGLE_LIGHT);
   else if (strcmp(topic, "balboa/cmd/high_range")   == 0) setPendingToggle(BALBOA_TOGGLE_TEMP_RANGE);
   else if (strcmp(topic, "balboa/cmd/heating_mode") == 0) setPendingToggle(BALBOA_TOGGLE_HEATING_MODE);
+  else if (strcmp(topic, "balboa/cmd/hold")         == 0) setPendingToggle(BALBOA_TOGGLE_HOLD);
   else if (strcmp(topic, "balboa/cmd/dump")         == 0) {
     g_rawDumpFrames = 200;
     Serial.printf("[CMD] raw dump: %u frames\n", (unsigned)g_rawDumpFrames);
