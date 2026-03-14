@@ -18,16 +18,18 @@ inline void rs485ReceiveMode()  { digitalWrite(PIN_DE_RE, LOW);  }
 inline void rs485TransmitMode() { digitalWrite(PIN_DE_RE, HIGH); }
 
 // -------------------------- Pending command queue ---------------------------
-enum CommandType : uint8_t { CMD_NONE = 0, CMD_TOGGLE, CMD_SET_TEMP, CMD_SET_TIME };
+enum CommandType : uint8_t { CMD_NONE = 0, CMD_TOGGLE, CMD_SET_TEMP, CMD_SET_TIME, CMD_SET_FILTER };
 struct PendingCommand {
   CommandType type;
   uint8_t     toggleByte;
   uint8_t     tempRaw;
   uint8_t     timeHour;
   uint8_t     timeMin;
+  uint8_t     fc1h, fc1m, fc1dh, fc1dm;  // filter cycle 1: start + duration
+  uint8_t     fc2h, fc2m, fc2dh, fc2dm;  // filter cycle 2: start (bit7=enabled) + duration
   bool        ready;
 };
-PendingCommand pendingCmd = { CMD_NONE, 0, 0, 0, 0, false };
+PendingCommand pendingCmd = { CMD_NONE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false };
 portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ------------------------------ Balboa items --------------------------------
@@ -326,6 +328,15 @@ void processFrame(const uint8_t* buf, size_t len) {
                       cmd.timeHour & 0x7F, cmd.timeMin,
                       (cmd.timeHour & 0x80) ? "24h" : "12h");
         g_rawDumpFrames = 10;
+      } else if (cmd.type == CMD_SET_FILTER) {
+        const uint8_t mt[] = { 0x0A, 0xBF, 0x23 };
+        const uint8_t pl[] = { cmd.fc1h, cmd.fc1m, cmd.fc1dh, cmd.fc1dm,
+                               cmd.fc2h, cmd.fc2m, cmd.fc2dh, cmd.fc2dm };
+        rs485Send(mt, pl, sizeof(pl), true, 2);
+        Serial.printf("[CMD] set_filter FC1=%02u:%02u dur=%uh%02um FC2=%02u:%02u dur=%uh%02um\n",
+                      cmd.fc1h, cmd.fc1m, cmd.fc1dh, cmd.fc1dm,
+                      cmd.fc2h & 0x7F, cmd.fc2m, cmd.fc2dh, cmd.fc2dm);
+        g_rawDumpFrames = 10;
       }
     }
     return;
@@ -334,6 +345,26 @@ void processFrame(const uint8_t* buf, size_t len) {
   // -------------------- Status update broadcast (FF AF 13) --------------------
   if (src == 0xFF && type == 0x13) {
     publishStatus(buf, len);
+    return;
+  }
+
+  // -------------------- Filter cycle config (BF 23) --------------------
+  if (cls == 0xBF && type == 0x23 && len >= 14) {
+    static uint8_t prevFilter[8] = {0xFF};
+    const uint8_t* pl = buf + 5;  // 8 payload bytes
+    if (memcmp(pl, prevFilter, 8) != 0) {
+      memcpy(prevFilter, pl, 8);
+      bool fc2en = (pl[4] & 0x80) != 0;
+      char json[200];
+      snprintf(json, sizeof(json),
+        "{\"fc1_start\":\"%02u:%02u\",\"fc1_dur\":\"%uh%02um\","
+        "\"fc2_start\":\"%02u:%02u\",\"fc2_dur\":\"%uh%02um\",\"fc2_enabled\":%d}",
+        pl[0], pl[1], pl[2], pl[3],
+        pl[4] & 0x7F, pl[5], pl[6], pl[7],
+        fc2en ? 1 : 0);
+      Serial.printf("[FILTER] %s\n", json);
+      if (mqtt.connected()) mqtt.publish("balboa/filter_config", json, true);
+    }
     return;
   }
 
@@ -454,6 +485,34 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       if (LOG_MQTT) Serial.printf("[CMD] queued set_time %02d:%02d (%s)\n", h, m, use24h ? "24h" : "12h");
     } else {
       if (LOG_MQTT) Serial.printf("[CMD] set_time invalid: %s (use HH:MM)\n", msg);
+    }
+  }
+  else if (strcmp(topic, "balboa/cmd/set_filter") == 0) {
+    // Format: "H1:M1 DH1:DM1 H2:M2 DH2:DM2"
+    // Příklad: "0:00 5:00 12:00 5:00" = FC1 00:00 trvá 5h, FC2 12:00 trvá 5h (FC2 vždy enabled)
+    int h1=-1, m1=-1, dh1=-1, dm1=-1, h2=-1, m2=-1, dh2=-1, dm2=-1;
+    int n = sscanf(msg, "%d:%d %d:%d %d:%d %d:%d", &h1, &m1, &dh1, &dm1, &h2, &m2, &dh2, &dm2);
+    if (n == 8 &&
+        h1 >= 0 && h1 <= 23 && m1 >= 0 && m1 <= 59 &&
+        dh1 >= 0 && dh1 <= 23 && dm1 >= 0 && dm1 <= 59 &&
+        h2 >= 0 && h2 <= 23 && m2 >= 0 && m2 <= 59 &&
+        dh2 >= 0 && dh2 <= 23 && dm2 >= 0 && dm2 <= 59) {
+      portENTER_CRITICAL(&pendingMux);
+      pendingCmd.type  = CMD_SET_FILTER;
+      pendingCmd.fc1h  = (uint8_t)h1;
+      pendingCmd.fc1m  = (uint8_t)m1;
+      pendingCmd.fc1dh = (uint8_t)dh1;
+      pendingCmd.fc1dm = (uint8_t)dm1;
+      pendingCmd.fc2h  = (uint8_t)(h2 | 0x80);  // bit7=1 = FC2 enabled
+      pendingCmd.fc2m  = (uint8_t)m2;
+      pendingCmd.fc2dh = (uint8_t)dh2;
+      pendingCmd.fc2dm = (uint8_t)dm2;
+      pendingCmd.ready = true;
+      portEXIT_CRITICAL(&pendingMux);
+      if (LOG_MQTT) Serial.printf("[CMD] queued set_filter FC1=%02d:%02d dur=%dh%02dm FC2=%02d:%02d dur=%dh%02dm\n",
+                                   h1, m1, dh1, dm1, h2, m2, dh2, dm2);
+    } else {
+      if (LOG_MQTT) Serial.printf("[CMD] set_filter invalid: %s (use H1:M1 DH1:DM1 H2:M2 DH2:DM2)\n", msg);
     }
   }
   else if (strcmp(topic, "balboa/cmd/clock_mode") == 0) {
