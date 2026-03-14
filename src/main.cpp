@@ -4,7 +4,7 @@
 #include "config.h"
 
 // ------------------------------ Logging -------------------------------------
-static bool LOG_CTS    = true;  // CTS / NTS events
+static bool LOG_CTS    = true;  // CTS / NTS events — enabled for address discovery
 static bool LOG_TX     = true;
 static bool LOG_STATUS = true;
 static bool LOG_MQTT   = true;
@@ -18,14 +18,16 @@ inline void rs485ReceiveMode()  { digitalWrite(PIN_DE_RE, LOW);  }
 inline void rs485TransmitMode() { digitalWrite(PIN_DE_RE, HIGH); }
 
 // -------------------------- Pending command queue ---------------------------
-enum CommandType : uint8_t { CMD_NONE = 0, CMD_TOGGLE, CMD_SET_TEMP };
+enum CommandType : uint8_t { CMD_NONE = 0, CMD_TOGGLE, CMD_SET_TEMP, CMD_SET_TIME };
 struct PendingCommand {
   CommandType type;
   uint8_t     toggleByte;
   uint8_t     tempRaw;
+  uint8_t     timeHour;
+  uint8_t     timeMin;
   bool        ready;
 };
-PendingCommand pendingCmd = { CMD_NONE, 0, 0, false };
+PendingCommand pendingCmd = { CMD_NONE, 0, 0, 0, 0, false };
 portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ------------------------------ Balboa items --------------------------------
@@ -37,25 +39,25 @@ portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 #define BALBOA_TOGGLE_HEATING_MODE 0x51
 
 // ------------------------------ RS485 protocol ------------------------------
-// Frame format: 7E [ML] [byte2] [0xBF] [type] [payload...] [CRC] 7E
-// byte2 = destination address (0xFE = broadcast unregistered, 0xFF = all,
-//         our assigned id = addressed to us)
+// Frame format: 7E [ML] [byte2] [0xBF/0xAF] [type] [payload...] [CRC] 7E
 //
-// Channel registration sequence:
-//   Spa  -> 7E .. FE BF 00 ..  "Any new clients?"
-//   Us   -> 7E .. FE BF 01 02 F1 73 ..  registration request
-//   Spa  -> 7E .. FE BF 02 [id] ..  "Here is your address"
-//   Us   -> 7E .. [id] BF 03 ..  ack
+// Observed bus traffic:
+//   10 BF 06  — CTS broadcast od spa (zdroj = 0x10), jakékoliv zařízení může odeslat
+//   10 BF 07  — NTS od fyzického panelu (adresa 0x10)
+//   FF AF 13  — status broadcast
 //
-// Poll cycle (after registration):
-//   Spa  -> 7E .. [id] BF 06 ..  Clear To Send (CTS)
-//   Us   -> command  OR  7E .. [id] BF 07 ..  Nothing To Send (NTS)
+// Naše odpověď na CTS: příkaz s adresou 0x0A (BWA app adresa) jako zdrojem,
+// nebo NTS 0A BF 07 pokud nemáme co poslat.
+// Kanálová registrace (FE BF 0x) tímto spa není podporována.
 //
 // Reference: https://github.com/ccutrer/balboa_worldwide_app/blob/main/doc/protocol.md
 
+// Adresa přidělená při registraci (FE BF 02). 0 = dosud neregistrováno.
+static uint8_t  g_ourAddr     = 0;
+static uint32_t g_lastRegSent = 0; // timestamp posledního FE BF 01 (rate limit)
+
 static uint32_t g_lastRxMs      = 0;
-static uint8_t  g_deviceId      = 0;   // assigned by spa (0 = unregistered)
-static uint32_t g_lastCtsMs     = 0;   // last CTS received (for re-registration watchdog)
+static uint32_t g_lastCtsMs     = 0;   // čas posledního CTS (watchdog)
 static uint8_t  g_rawDumpFrames = 0;   // dump next N raw frames (debug)
 
 static uint8_t balboaCRC(const uint8_t* data, uint8_t len) {
@@ -81,7 +83,11 @@ static bool validateFrame(const uint8_t* buf, size_t len) {
   return packetCrc == calcCrc;
 }
 
-void rs485Send(const uint8_t mt[3], const uint8_t* pl, uint8_t plLen, bool logFrame = true) {
+// holdUs: extra µs to keep DE=HIGH after TX + echo (blocks bus from other transmitters).
+// Use holdUs≈700 when sending as CTS response (blocks physical panel's NTS at ~1.4ms).
+// Returns true if echo bytes matched (TX confirmed working), false on mismatch or timeout.
+bool rs485Send(const uint8_t mt[3], const uint8_t* pl, uint8_t plLen, bool logFrame = true,
+               uint8_t echoWaitMs = 10, uint16_t holdUs = 0) {
   uint8_t frame[64];
   uint8_t fi = 0;
 
@@ -101,65 +107,69 @@ void rs485Send(const uint8_t mt[3], const uint8_t* pl, uint8_t plLen, bool logFr
   frame[fi++] = 0x7E;
 
   rs485TransmitMode();
-  delayMicroseconds(100);
   Serial2.write(frame, fi);
   Serial2.flush();
+  rs485ReceiveMode();  // DE=LOW immediately — must not hold bus while panel sends NTS at ~1.4ms
 
-  // Read & discard echo (RS485 half-duplex loopback) — exactly fi bytes,
-  // so we don't accidentally swallow the spa's immediate response.
-  uint32_t echoDeadline = millis() + 10;
+  // Read echo bytes (RS485 half-duplex loopback) and verify they match
+  uint32_t echoDeadline = millis() + echoWaitMs;
   size_t   echoRead     = 0;
+  uint8_t  echoBuf[64];
   while (echoRead < fi && (int32_t)(echoDeadline - millis()) > 0) {
-    if (Serial2.available()) { Serial2.read(); echoRead++; }
+    if (Serial2.available()) { echoBuf[echoRead++] = Serial2.read(); }
   }
-  rs485ReceiveMode();
+
+  // Note: with DE/RE tied together, receiver is OFF during TX → echo=0 is expected.
+  // Echo verification only works if RE stays LOW while DE=HIGH (separate control).
+  (void)echoRead; (void)echoBuf;
 
   if (LOG_TX && logFrame) {
     Serial.printf("[TX] %uB:", fi);
     for (uint8_t i = 0; i < fi; i++) Serial.printf(" %02X", frame[i]);
     Serial.println();
   }
+  return true;
 }
 
 // ------------------------------ Registration --------------------------------
 
-void sendIDRequest() {
-  // Registration request: FE BF 01, payload = device identifier bytes
+void sendRegistrationRequest() {
+  // Odpověď na "Any new clients?" (FE BF 00)
+  // Payload: 02 F1 73 (device_type + fixed ID, dle referenčního projektu)
   const uint8_t mt[] = { 0xFE, 0xBF, 0x01 };
   const uint8_t pl[] = { 0x02, 0xF1, 0x73 };
-  rs485Send(mt, pl, sizeof(pl), true);
-  if (LOG_REG) Serial.println("[REG] ID request sent");
-  g_rawDumpFrames = 5; // dump next 5 raw frames to see spa's response
+  bool ok = rs485Send(mt, pl, sizeof(pl), true);
+  Serial.printf("[REG] sent FE BF 01 (echo %s)\n", ok ? "OK" : "FAIL — TX problem?");
+  g_rawDumpFrames = 15; // zachyť odpověď spa (FE BF 02)
 }
 
-void sendIDAck() {
-  // Acknowledge assigned address: [id] BF 03
-  const uint8_t mt[] = { g_deviceId, 0xBF, 0x03 };
+void sendRegistrationAck() {
+  // ACK po přijetí přiřazené adresy (FE BF 02)
+  const uint8_t mt[] = { g_ourAddr, 0xBF, 0x03 };
   rs485Send(mt, nullptr, 0, true);
-  if (LOG_REG) Serial.printf("[REG] ID ack sent (id=0x%02X)\n", g_deviceId);
+  Serial.printf("[REG] sent ACK (0x%02X BF 03)\n", g_ourAddr);
 }
 
 void sendNTS() {
-  // Nothing To Send: [id] BF 07
-  const uint8_t mt[] = { g_deviceId, 0xBF, 0x07 };
+  if (g_ourAddr == 0) return; // nemáme adresu, neodesílat NTS
+  const uint8_t mt[] = { g_ourAddr, 0xBF, 0x07 };
   rs485Send(mt, nullptr, 0, false);
 }
 
 // ------------------------------ Commands ------------------------------------
 
 void sendToggle(uint8_t item) {
-  // Toggle item: [id] BF 11, payload = [item, 0x00]
-  const uint8_t mt[] = { g_deviceId, 0xBF, 0x11 };
-  const uint8_t pl[] = { item, 0x00 };
-  rs485Send(mt, pl, sizeof(pl), true);
+  // Toggle is sent as response to CTS — queue it, do not send unsolicited.
+  // This function is kept for completeness but pendingCmd queue is the primary path.
+  Serial.println("[CMD] sendToggle called directly — use pendingCmd queue instead");
 }
 
 void sendSetTemp(uint8_t tempRaw) {
-  // Set temperature: [id] BF 20, payload = [tempRaw]
-  const uint8_t mt[] = { g_deviceId, 0xBF, 0x20 };
+  // set_temp sent as CTS response from 0x0A (BWA WiFi module address)
+  const uint8_t mt[] = { 0x0A, 0xBF, 0x20 };
   const uint8_t pl[] = { tempRaw };
-  rs485Send(mt, pl, sizeof(pl), true);
-  if (LOG_TX) Serial.printf("[TX] set_temp %.1f C (raw 0x%02X)\n", tempRaw / 2.0f, tempRaw);
+  rs485Send(mt, pl, sizeof(pl), true, 2);
+  Serial.printf("[CMD] set_temp %.1f C (raw 0x%02X)\n", tempRaw / 2.0f, tempRaw);
 }
 
 // buf[0]=7E, buf[1]=ML, buf[2]=dest, buf[3]=class(BF/AF), buf[4]=type, buf[5..]=payload
@@ -173,15 +183,19 @@ void publishStatus(const uint8_t* buf, size_t len) {
 
   const uint32_t now = millis();
 
-  const uint8_t waterRaw = buf[7];
-  const uint8_t setRaw   = buf[25];
-  const uint8_t flags4   = buf[15];
-  const uint8_t pp       = buf[16];
-  const uint8_t flags5   = buf[18];
-  const uint8_t lf       = buf[19];
-  const uint8_t flags3   = buf[14];
+  const uint8_t waterRaw  = buf[7];
+  const uint8_t timeHour  = buf[8];   // 0-23
+  const uint8_t timeMin   = buf[9];   // 0-59
+  const uint8_t heatMode  = buf[10];  // 0=ready, 1=economy/rest
+  const uint8_t flags3    = buf[14];
+  // flags3 bit 0: temp scale (0=°F, 1=°C), bit 1: clock mode (0=12h, 1=24h)
+  const uint8_t flags4    = buf[15];
+  const uint8_t pp        = buf[16];
+  const uint8_t flags5    = buf[18];
+  const uint8_t lf        = buf[19];
+  const uint8_t setRaw    = buf[25];
 
-  uint8_t curr[7] = { waterRaw, setRaw, flags4, pp, flags5, lf, flags3 };
+  uint8_t curr[9] = { waterRaw, setRaw, flags4, pp, flags5, lf, flags3, heatMode, timeHour };
   bool changed  = !havePrev || memcmp(curr, prev, 7) != 0;
   bool periodic = (now - lastPublishMs) >= 10000;
 
@@ -204,20 +218,31 @@ void publishStatus(const uint8_t* buf, size_t len) {
   bool light       = (lf & 0x03) == 0x03;
 
   if (changed) {
-    Serial.printf("[RAW] w=%02X s=%02X f4=%02X pp=%02X f5=%02X lf=%02X f3=%02X\n",
-                  waterRaw, setRaw, flags4, pp, flags5, lf, flags3);
+    Serial.printf("[RAW] w=%02X s=%02X t=%02u:%02u hm=%02X f4=%02X pp=%02X f5=%02X lf=%02X f3=%02X\n",
+                  waterRaw, setRaw, timeHour, timeMin, heatMode, flags4, pp, flags5, lf, flags3);
   }
 
-  char json[320];
+  // heating_mode: 0=ready (připravený), 1=economy (ekonomický/rest)
+  const char* heatModeStr = (heatMode == 0) ? "ready" : "economy";
+  bool clockMode24h = (flags3 & 0x02) != 0;  // bit 1 = 24h mode
+  bool tempCelsius  = (flags3 & 0x01) != 0;  // bit 0 = Celsius (informativní)
+
+  char json[384];
   snprintf(json, sizeof(json),
     "{\"water_temp\":%.1f,\"set_temp\":%.1f,"
+    "\"time\":\"%02u:%02u\","
     "\"jets1\":%d,\"jets2\":%d,\"blower\":%d,"
     "\"heater\":%d,\"circulation\":%d,"
-    "\"high_range\":%d,\"light\":%d}",
+    "\"high_range\":%d,\"light\":%d,"
+    "\"heating_mode\":\"%s\","
+    "\"clock_24h\":%d}",
     waterTemp, setTemp,
+    timeHour, timeMin,
     jets1?1:0, jets2?1:0, blower?1:0,
     heater?1:0, circulation?1:0,
-    highRange?1:0, light?1:0
+    highRange?1:0, light?1:0,
+    heatModeStr,
+    clockMode24h?1:0
   );
 
   if (LOG_STATUS)
@@ -243,82 +268,105 @@ void processFrame(const uint8_t* buf, size_t len) {
     g_rawDumpFrames--;
   }
 
-  const uint8_t dest = buf[2]; // byte2 (source nebo dest podle směru)
+  const uint8_t src  = buf[2]; // zdrojová adresa odesílatele
   const uint8_t cls  = buf[3]; // class byte (0xBF nebo 0xAF)
   const uint8_t type = buf[4]; // typ zprávy
 
-  // -------------------- Channel registration --------------------
-  // "Any new clients?" FE BF 00
-  if (dest == 0xFE && cls == 0xBF && type == 0x00) {
-    if (g_deviceId == 0) {
-      if (LOG_REG) Serial.println("[REG] Got 'Any new clients?' -> sending ID request");
-      // Clear any stuck pending command so it doesn't block after registration
-      portENTER_CRITICAL(&pendingMux);
-      pendingCmd.ready = false;
-      pendingCmd.type  = CMD_NONE;
-      portEXIT_CRITICAL(&pendingMux);
-      sendIDRequest();
-    }
-    return;
-  }
-
-  // "Here is your assigned ID" — typ 0x02, byte[2] může být 0xFE nebo 0x10 (adresa spa)
-  if (cls == 0xBF && type == 0x02 && g_deviceId == 0) {
-    if (len >= 7) {
-      uint8_t newId = buf[5];
-      if (newId > 0x2F) newId = 0x2F;
-      g_deviceId = newId;
-      if (LOG_REG) Serial.printf("[REG] Assigned ID: 0x%02X (from byte2=0x%02X)\n", g_deviceId, dest);
-      sendIDAck();
-    }
-    return;
-  }
-
-  // Silently ignore CTS/NTS for other registered devices (reduces log noise)
-  if (dest != 0xFE && dest != 0xFF && cls == 0xBF && (type == 0x06 || type == 0x07) && dest != g_deviceId)
-    return;
-
-  // -------------------- CTS (Clear To Send) addressed to us --------------------
-  if (g_deviceId != 0 && dest == g_deviceId && cls == 0xBF && type == 0x06) {
+  // -------------------- CTS — Clear To Send (BF 06) --------------------
+  // Spa sends CTS to 0x10 (physical panel). Registration (FE BF 02) never arrives.
+  // Strategy: do NOT intercept CTS — let the panel respond normally with NTS.
+  // We send our command AFTER the panel's NTS (see handler below).
+  if (cls == 0xBF && type == 0x06) {
     g_lastCtsMs = millis();
+    const uint8_t dest = buf[2];
+    if (LOG_CTS && dest != 0x10) Serial.printf("[CTS] dest=0x%02X (unexpected)\n", dest);
+    return;
+  }
 
+  // -------------------- NTS from panel (BF 07) — send command in gap after NTS --------------------
+  // After panel responds NTS, there is a gap (~5-50ms) before next CTS.
+  // We send our command unsolicited from 0x0A during this gap.
+  if (cls == 0xBF && type == 0x07) {
     PendingCommand cmd;
     portENTER_CRITICAL(&pendingMux);
-    cmd              = pendingCmd;
-    pendingCmd.ready = false;
-    pendingCmd.type  = CMD_NONE;
+    cmd = pendingCmd;
+    if (cmd.ready) {
+      pendingCmd.ready = false;
+      pendingCmd.type  = CMD_NONE;
+    }
     portEXIT_CRITICAL(&pendingMux);
 
     if (cmd.ready) {
-      if (LOG_CTS) Serial.printf("[CTS] sending cmd type=%d\n", cmd.type);
-      if (cmd.type == CMD_TOGGLE)   sendToggle(cmd.toggleByte);
-      if (cmd.type == CMD_SET_TEMP) sendSetTemp(cmd.tempRaw);
-    } else {
-      sendNTS();
-      if (LOG_CTS) Serial.println("[CTS] NTS");
+      delayMicroseconds(300);  // small gap after panel NTS before our frame
+      if (cmd.type == CMD_TOGGLE) {
+        if (cmd.toggleByte == 0xFD) {
+          // clock_mode: 0x0A BF 26 [temp_scale=1(°C), clock_mode(0=12h,1=24h)]
+          const uint8_t mt[] = { 0x0A, 0xBF, 0x26 };
+          const uint8_t pl[] = { 0x01, cmd.tempRaw };  // 0x01=Celsius, clock_mode
+          rs485Send(mt, pl, sizeof(pl), true, 2);
+          Serial.printf("[CMD] clock_mode %s sent after NTS\n", cmd.tempRaw ? "24h" : "12h");
+        } else {
+          const uint8_t mt[] = { 0x0A, 0xBF, 0x11 };
+          const uint8_t pl[] = { cmd.toggleByte, 0x00 };
+          rs485Send(mt, pl, sizeof(pl), true, 2);
+          Serial.printf("[CMD] toggle 0x%02X sent after NTS\n", cmd.toggleByte);
+        }
+        g_rawDumpFrames = 10;
+      } else if (cmd.type == CMD_SET_TEMP) {
+        const uint8_t mt[] = { 0x0A, 0xBF, 0x20 };
+        const uint8_t pl[] = { cmd.tempRaw };
+        rs485Send(mt, pl, sizeof(pl), true, 2);
+        Serial.printf("[CMD] set_temp raw=0x%02X sent after NTS\n", cmd.tempRaw);
+        g_rawDumpFrames = 10;
+      } else if (cmd.type == CMD_SET_TIME) {
+        const uint8_t mt[] = { 0x0A, 0xBF, 0x21 };
+        const uint8_t pl[] = { cmd.timeHour, cmd.timeMin };
+        rs485Send(mt, pl, sizeof(pl), true, 2);
+        Serial.printf("[CMD] set_time %02u:%02u (%s) sent after NTS\n",
+                      cmd.timeHour & 0x7F, cmd.timeMin,
+                      (cmd.timeHour & 0x80) ? "24h" : "12h");
+        g_rawDumpFrames = 10;
+      }
     }
     return;
   }
 
-  // -------------------- Status update (broadcast) --------------------
-  // FF AF 13
-  if (dest == 0xFF && type == 0x13) {
+  // -------------------- Status update broadcast (FF AF 13) --------------------
+  if (src == 0xFF && type == 0x13) {
     publishStatus(buf, len);
     return;
   }
 
-  // -------------------- Ignore known noise --------------------
-  if (cls == 0xBF && type == 0x07) return; // NTS from other clients
-  // Log unhandled FE BF frames to help diagnose registration
-  if (dest == 0xFE && cls == 0xBF) {
-    Serial.printf("[REG?] Unhandled FE BF type=%02X len=%u:", type, (unsigned)len);
-    for (size_t i = 0; i < len; i++) Serial.printf(" %02X", buf[i]);
-    Serial.println();
+  // -------------------- Registrační handshake (FE BF 00/02) --------------------
+  if (src == 0xFE && cls == 0xBF) {
+    if (type == 0x00) {
+      // "Any new clients?" — rate limit 15s, jen bez přiřazené adresy
+      if (LOG_REG) Serial.println("[REG] received FE BF 00 (Any new clients?)");
+      if (g_ourAddr == 0 && (millis() - g_lastRegSent) >= 15000) {
+        g_lastRegSent = millis();
+        sendRegistrationRequest();
+      } else if (g_ourAddr == 0) {
+        Serial.printf("[REG] rate-limited, skip (%.0fs since last)\n", (millis()-g_lastRegSent)/1000.0f);
+      }
+    } else if (type == 0x02 && len > 5) {
+      // Přiřazení adresy: buf[5] = payload[0] = assigned channel
+      g_ourAddr = buf[5];
+      if (g_ourAddr > 0x2F) g_ourAddr = 0x2F;
+      Serial.printf("[REG] assigned channel 0x%02X\n", g_ourAddr);
+      sendRegistrationAck();
+      // After ACK, send config request (BF 22) — required by Balboa WiFi protocol
+      // before spa will accept toggle commands from this module.
+      g_rawDumpFrames = 20;
+      const uint8_t mt22[] = { g_ourAddr, 0xBF, 0x22 };
+      const uint8_t pl22[] = { 0x00, 0x00, 0x01 };
+      rs485Send(mt22, pl22, sizeof(pl22), true);
+      Serial.println("[REG] sent config request (BF 22)");
+    }
     return;
   }
 
-  // Debug unknown frames (limited output)
-  Serial.printf("[OTHER] %uB dest=%02X cls=%02X type=%02X:", (unsigned)len, dest, cls, type);
+  // Debug neznámých framů
+  Serial.printf("[OTHER] %uB src=%02X cls=%02X type=%02X:", (unsigned)len, src, cls, type);
   for (size_t i = 0; i < len && i < 16; i++) Serial.printf(" %02X", buf[i]);
   if (len > 16) Serial.print(" ...");
   Serial.println();
@@ -331,16 +379,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (LOG_MQTT) Serial.printf("[MQTT] %s -> %s\n", topic, msg);
 
   auto setPendingToggle = [&](uint8_t item) {
-    bool busy = false;
     portENTER_CRITICAL(&pendingMux);
-    busy = pendingCmd.ready;
-    if (!busy) {
-      pendingCmd.type       = CMD_TOGGLE;
-      pendingCmd.toggleByte = item;
-      pendingCmd.ready      = true;
-    }
+    pendingCmd.type       = CMD_TOGGLE;
+    pendingCmd.toggleByte = item;
+    pendingCmd.ready      = true;
     portEXIT_CRITICAL(&pendingMux);
-    if (LOG_MQTT) Serial.printf("[CMD] %s toggle 0x%02X\n", busy ? "ignored (busy)" : "queued", item);
+    if (LOG_MQTT) Serial.printf("[CMD] queued toggle 0x%02X\n", item);
   };
 
   if      (strcmp(topic, "balboa/cmd/jets1")        == 0) setPendingToggle(BALBOA_TOGGLE_JETS1);
@@ -349,22 +393,76 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   else if (strcmp(topic, "balboa/cmd/light")        == 0) setPendingToggle(BALBOA_TOGGLE_LIGHT);
   else if (strcmp(topic, "balboa/cmd/high_range")   == 0) setPendingToggle(BALBOA_TOGGLE_TEMP_RANGE);
   else if (strcmp(topic, "balboa/cmd/heating_mode") == 0) setPendingToggle(BALBOA_TOGGLE_HEATING_MODE);
-  else if (strcmp(topic, "balboa/cmd/set_temp")     == 0) {
-    float t = atof(msg);
-    if (t >= 10.0f && t <= 40.0f) {
-      uint8_t raw = (uint8_t)(t * 2.0f + 0.5f);
+  else if (strcmp(topic, "balboa/cmd/dump")         == 0) {
+    g_rawDumpFrames = 200;
+    Serial.printf("[CMD] raw dump: %u frames\n", (unsigned)g_rawDumpFrames);
+  }
+  else if (strcmp(topic, "balboa/cmd/passive")      == 0) {
+    // Pasivní mód: jen posloucháme, neodesíláme NTS/příkazy — pro zachycení panelových framů
+    g_ourAddr = 0;
+    g_rawDumpFrames = 500;
+    Serial.println("[CMD] passive mode: addr=0, dump 500 frames");
+  }
+  else if (strcmp(topic, "balboa/cmd/config_req")   == 0) {
+    // Config request: id BF 22 00 00 01
+    if (g_ourAddr != 0) {
+      const uint8_t mt[] = { g_ourAddr, 0xBF, 0x22 };
+      const uint8_t pl[] = { 0x00, 0x00, 0x01 };
       bool busy = false;
       portENTER_CRITICAL(&pendingMux);
       busy = pendingCmd.ready;
       if (!busy) {
-        pendingCmd.type    = CMD_SET_TEMP;
-        pendingCmd.tempRaw = raw;
-        pendingCmd.ready   = true;
+        // Použijeme CMD_TOGGLE s "magic" byte 0xFF jako marker pro config
+        pendingCmd.type       = CMD_TOGGLE;
+        pendingCmd.toggleByte = 0xFE; // special — bude handled níže
+        pendingCmd.ready      = true;
       }
       portEXIT_CRITICAL(&pendingMux);
-      if (LOG_MQTT) Serial.printf("[CMD] %s set_temp %.1f C\n", busy ? "ignored (busy)" : "queued", t);
+      if (!busy) {
+        g_rawDumpFrames = 20;
+        Serial.println("[CMD] queued config request");
+      }
+    }
+  }
+  else if (strcmp(topic, "balboa/cmd/set_temp")     == 0) {
+    float t = atof(msg);
+    if (t >= 10.0f && t <= 40.0f) {
+      uint8_t raw = (uint8_t)(t * 2.0f + 0.5f);
+      portENTER_CRITICAL(&pendingMux);
+      pendingCmd.type    = CMD_SET_TEMP;
+      pendingCmd.tempRaw = raw;
+      pendingCmd.ready   = true;
+      portEXIT_CRITICAL(&pendingMux);
+      if (LOG_MQTT) Serial.printf("[CMD] queued set_temp %.1f C\n", t);
     } else {
       if (LOG_MQTT) Serial.printf("[CMD] set_temp out of range: %.1f\n", t);
+    }
+  }
+  else if (strcmp(topic, "balboa/cmd/set_time") == 0) {
+    // Formát: "HH:MM" (24h) nebo "HH:MM 12" pro 12h mód
+    // Bit 7 hodinového bajtu = 24h příznak (dle protokolu, zjištěno z panelu)
+    int h = -1, m = -1;
+    sscanf(msg, "%d:%d", &h, &m);
+    bool use24h = (strstr(msg, "12") == nullptr); // default 24h, pokud není "12" v payload
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+      portENTER_CRITICAL(&pendingMux);
+      pendingCmd.type     = CMD_SET_TIME;
+      pendingCmd.timeHour = (uint8_t)(h | (use24h ? 0x80 : 0x00));
+      pendingCmd.timeMin  = (uint8_t)m;
+      pendingCmd.ready    = true;
+      portEXIT_CRITICAL(&pendingMux);
+      if (LOG_MQTT) Serial.printf("[CMD] queued set_time %02d:%02d (%s)\n", h, m, use24h ? "24h" : "12h");
+    } else {
+      if (LOG_MQTT) Serial.printf("[CMD] set_time invalid: %s (use HH:MM)\n", msg);
+    }
+  }
+  else if (strcmp(topic, "balboa/cmd/clock_mode") == 0) {
+    // Přepnutí 12h/24h bez změny času — použij set_time s aktuálním časem
+    // Posíláme BF 21 s hodinami | 0x80 pro 24h, nebo bez 0x80 pro 12h
+    // Čas bude nutné nastavit zvlášť (nevíme přesný aktuální čas v tomto callbacku)
+    int mode = atoi(msg);
+    if (mode == 12 || mode == 24) {
+      if (LOG_MQTT) Serial.printf("[CMD] clock_mode %dh — use set_time HH:MM to apply\n", mode);
     }
   }
 }
@@ -408,10 +506,10 @@ void setup() {
   connectMQTT();
 
   Serial.println("Listening...");
-  Serial.println("Waiting for registration (FE BF 00) and status updates (FF AF 13)...");
 }
 
 void loop() {
+  // MQTT: process up to 1ms — then immediately give RS485 priority
   if (!mqtt.connected()) {
     if (millis() - lastMqttReconnect > 3000) {
       lastMqttReconnect = millis();
@@ -421,35 +519,33 @@ void loop() {
     mqtt.loop();
   }
 
-  // No RS485 traffic watchdog — reset registration
+  // Watchdog: žádný RS485 provoz
   if (g_lastRxMs != 0 && (millis() - g_lastRxMs) > 15000) {
-    Serial.println("[WARN] no RS485 traffic for 15s — resetting registration");
-    g_lastRxMs  = millis();
-    g_deviceId  = 0;
-    g_lastCtsMs = 0;
+    Serial.println("[WARN] no RS485 traffic for 15s");
+    g_lastRxMs = millis();
+  }
+  // Watchdog: žádné CTS po 10s
+  if (g_lastCtsMs != 0 && (millis() - g_lastCtsMs) > 10000) {
+    Serial.println("[WARN] no CTS for 10s");
+    g_lastCtsMs = millis();
   }
 
-  // Registered but no CTS for 10s — spa dropped us, re-register
-  if (g_deviceId != 0 && g_lastCtsMs != 0 && (millis() - g_lastCtsMs) > 10000) {
-    Serial.printf("[WARN] no CTS for 10s (was id=0x%02X) — re-registering\n", g_deviceId);
-    g_deviceId  = 0;
-    g_lastCtsMs = 0;
-  }
-
+  // RS485 — process ALL available bytes immediately after MQTT
   static uint8_t buffer[256];
   static size_t  index = 0;
 
   while (Serial2.available()) {
     uint8_t b = Serial2.read();
-    if (index < sizeof(buffer)) buffer[index++] = b;
-
-    // Frame boundary: two consecutive 0x7E bytes (end of frame + start of next)
-    if (index >= 2 && buffer[index-2] == 0x7E && buffer[index-1] == 0x7E) {
-      processFrame(buffer, index - 1);
+    if (b == 0x7E) {
+      if (index > 1) {
+        buffer[index++] = b;
+        processFrame(buffer, index);
+      }
       buffer[0] = 0x7E;
       index = 1;
+    } else {
+      if (index < sizeof(buffer)) buffer[index++] = b;
+      if (index >= sizeof(buffer)) index = 0;
     }
-
-    if (index >= sizeof(buffer)) index = 0;
   }
 }
