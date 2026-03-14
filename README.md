@@ -5,6 +5,33 @@ ESP32 module for remote control of a Balboa hot tub via RS485 bus and MQTT.
 
 ---
 
+## Fotografie / Photos
+
+### Hardware
+
+| Prototyp (breadboard) | Finální stavba v krabičce |
+|---|---|
+| ![Prototyp](docs/IMG_3631.jpg) | ![Finální stavba](docs/IMG_3638.jpg) |
+
+| Instalace u vířivky | Balboa řídicí deska |
+|---|---|
+| ![Instalace](docs/IMG_3639.jpg) | ![Balboa deska](docs/IMG_3555.jpg) |
+
+![Instalace detail](docs/IMG_3369.jpg)
+*Detail instalace — krabička s ESP32 připojená na RS485 sběrnici vířivky*
+
+### HomeKit & Home Assistant
+
+| HomeKit — teplota | HomeKit — trysky 1 |
+|---|---|
+| ![HomeKit teplota](docs/IMG_3642.png) | ![HomeKit trysky](docs/IMG_3643.png) |
+
+| Home Assistant — teplota | Home Assistant — trysky 1 |
+|---|---|
+| ![HA teplota](docs/IMG_3640.png) | ![HA trysky](docs/IMG_3641.png) |
+
+---
+
 ## 🇨🇿 Česky
 
 ### Popis
