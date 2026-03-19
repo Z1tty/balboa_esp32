@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include "config.h"
 
@@ -200,7 +201,7 @@ void publishStatus(const uint8_t* buf, size_t len) {
   const uint8_t lf        = buf[19];
   const uint8_t setRaw    = buf[25];
 
-  bool holdActive = (holdState != 0x00);
+  bool holdActive = (holdState == 0x05);  // 0x05 = Hold Mode per protocol; other non-zero values = A/B dual temp or other flags
 
   uint8_t curr[9] = { waterRaw, setRaw, flags4, pp, flags5, lf, flags3, heatMode, holdMins };
   bool changed  = !havePrev || memcmp(curr, prev, 8) != 0;
@@ -275,6 +276,15 @@ void processFrame(const uint8_t* buf, size_t len) {
     Serial.printf("[RAW%u] %uB:", g_rawDumpFrames, (unsigned)len);
     for (size_t i = 0; i < len; i++) Serial.printf(" %02X", buf[i]);
     Serial.println();
+    // Publish status frames (FF AF 13) to MQTT as hex for remote debugging
+    if (buf[2] == 0xFF && buf[4] == 0x13 && mqtt.connected()) {
+      char hex[256];
+      size_t hi = 0;
+      for (size_t i = 0; i < len && hi + 3 < sizeof(hex); i++)
+        hi += snprintf(hex + hi, sizeof(hex) - hi, "%02X ", buf[i]);
+      if (hi > 0) hex[hi - 1] = '\0';
+      mqtt.publish("balboa/raw", hex);
+    }
     g_rawDumpFrames--;
   }
 
@@ -561,6 +571,21 @@ void connectWiFi() {
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 }
 
+void setupOTA() {
+  ArduinoOTA.setHostname("balboa-esp32");
+  ArduinoOTA.onStart([]() {
+    Serial.println("[OTA] start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("[OTA] done — rebooting");
+  });
+  ArduinoOTA.onError([](ota_error_t e) {
+    Serial.printf("[OTA] error %u\n", e);
+  });
+  ArduinoOTA.begin();
+  Serial.println("[OTA] ready (hostname: balboa-esp32)");
+}
+
 void connectMQTT() {
   if (mqtt.connected()) return;
   Serial.print("MQTT connect... ");
@@ -589,12 +614,15 @@ void setup() {
   mqtt.setCallback(mqttCallback);
 
   connectWiFi();
+  setupOTA();
   connectMQTT();
 
   Serial.println("Listening...");
 }
 
 void loop() {
+  ArduinoOTA.handle();
+
   // MQTT: process up to 1ms — then immediately give RS485 priority
   if (!mqtt.connected()) {
     if (millis() - lastMqttReconnect > 3000) {

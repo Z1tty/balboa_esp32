@@ -76,6 +76,20 @@ Vířivka má dedikovaný WiFi slot **J35** (a fyzický panel na J34) — oba sd
 2. Vyplň WiFi SSID/heslo a adresu MQTT brokeru
 3. Nahraj firmware přes PlatformIO: `pio run --target upload`
 
+### OTA aktualizace (po prvním nahrání přes USB)
+
+Firmware obsahuje ArduinoOTA — po prvním USB flashování lze všechny další aktualizace nahrávat přes WiFi:
+
+```bash
+# Ve platformio.ini přidej (nebo dočasně přepiš upload_port):
+upload_protocol = espota
+upload_port = balboa-esp32.local   # nebo přímo IP adresa ESP32
+
+pio run --target upload
+```
+
+ESP32 se hlásí v síti jako `balboa-esp32` (mDNS). OTA heslo není nastaveno.
+
 ### MQTT — čtení stavu
 
 **Topic:** `balboa/state` (retained JSON, aktualizuje se při každé změně nebo každých 10s)
@@ -218,6 +232,20 @@ The hot tub has a dedicated WiFi slot **J35** (physical panel on J34) — both s
 1. Copy `include/config.h.example` to `include/config.h`
 2. Fill in your WiFi SSID/password and MQTT broker address
 3. Upload firmware via PlatformIO: `pio run --target upload`
+
+### OTA updates (after initial USB flash)
+
+The firmware includes ArduinoOTA — after the first USB flash, all subsequent updates can be uploaded over WiFi:
+
+```bash
+# Add to platformio.ini (or temporarily override upload_port):
+upload_protocol = espota
+upload_port = balboa-esp32.local   # or direct IP address
+
+pio run --target upload
+```
+
+The ESP32 announces itself as `balboa-esp32` on the network (mDNS). No OTA password is set.
 
 ### MQTT — reading state
 
