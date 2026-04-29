@@ -179,6 +179,7 @@ void sendSetTemp(uint8_t tempRaw) {
 // buf[0]=7E, buf[1]=ML, buf[2]=dest, buf[3]=class(BF/AF), buf[4]=type, buf[5..]=payload
 void publishStatus(const uint8_t* buf, size_t len) {
   if (len < 30) return;
+  if (buf[7] == 0xFF) return;  // 127.5°C = spa ještě neposlala platný status
 
   static uint32_t lastPublishMs = 0;
   static uint32_t lastAnyMs     = 0;
