@@ -567,7 +567,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void connectWiFi() {
   Serial.print("Connecting WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  uint32_t startMs = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - startMs > 30000) {  // restart WiFi stack každých 30s — router nemusel ještě naběhnout
+      Serial.println("\n[WiFi] retry...");
+      WiFi.disconnect();
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      startMs = millis();
+    }
+  }
   Serial.println("\nWiFi OK");
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 }
@@ -623,6 +634,17 @@ void setup() {
 
 void loop() {
   ArduinoOTA.handle();
+
+  // WiFi watchdog — reconnect každých 10 minut pokud je odpojeno (výpadek proudu, restart routeru)
+  static uint32_t lastWifiReconnect = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWifiReconnect > 600000) {
+      lastWifiReconnect = millis();
+      Serial.println("[WiFi] disconnected, reconnecting...");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+  }
 
   // MQTT: process up to 1ms — then immediately give RS485 priority
   if (!mqtt.connected()) {
